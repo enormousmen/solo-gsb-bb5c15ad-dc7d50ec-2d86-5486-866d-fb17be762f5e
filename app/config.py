@@ -29,6 +29,14 @@ BACKOFF_BASE = float(os.getenv("BACKOFF_BASE_SECONDS", "1"))
 # How often an idle worker polls the database for due tasks.
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_SECONDS", "0.2"))
 
+# Consecutive final delivery failures that trip a subscription's circuit
+# breaker into the open state (workers stop claiming its tasks).
+BREAKER_FAILURE_THRESHOLD = int(os.getenv("BREAKER_FAILURE_THRESHOLD", "3"))
+
+# How long an open breaker waits before letting the earliest pending task
+# through as the single half-open probe.
+BREAKER_COOLDOWN_SECONDS = float(os.getenv("BREAKER_COOLDOWN_SECONDS", "30"))
+
 
 def retry_delay(attempt_no: int) -> float:
     """Delay before the next attempt, given the attempt that just failed.

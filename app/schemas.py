@@ -27,6 +27,11 @@ class SubscriptionOut(BaseModel):
     paused_at: str | None
     rotating: bool
     previous_secret_expires_at: str | None
+    # Delivery circuit breaker: closed (normal) / open (deliveries paused,
+    # tasks still accepted) / half_open (single probe in flight).
+    state: str
+    consecutive_failures: int
+    next_probe_at: str | None
 
 
 class SecretRotationCreate(BaseModel):

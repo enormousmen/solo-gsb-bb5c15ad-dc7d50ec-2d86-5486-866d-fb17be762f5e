@@ -20,7 +20,12 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     created_at  REAL NOT NULL,
     paused_at   REAL,                   -- epoch seconds while paused; NULL when active
     previous_secret            TEXT,    -- retired secret, dual-signed during the grace window
-    previous_secret_expires_at REAL     -- epoch seconds when the previous secret stops being sent
+    previous_secret_expires_at REAL,    -- epoch seconds when the previous secret stops being sent
+    breaker_state TEXT NOT NULL DEFAULT 'closed'
+                  CHECK (breaker_state IN ('closed', 'open', 'half_open')),
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    breaker_opened_at      REAL,        -- epoch when the breaker last opened; cooldown runs from here
+    breaker_probe_task_id  INTEGER      -- pinned half-open probe task; NULL unless half_open
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -71,12 +76,22 @@ CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts (task_id);
 
 
 class Database:
-    def __init__(self, path: str):
+    def __init__(
+        self,
+        path: str,
+        breaker_failure_threshold: int = 3,
+        breaker_cooldown_seconds: float = 30.0,
+    ):
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._lock = threading.Lock()
+        # Per-subscription circuit-breaker tuning (see claim_due_task /
+        # finish_attempt): consecutive final failures that open the breaker,
+        # and the cooldown before the single half-open probe is allowed.
+        self._breaker_threshold = breaker_failure_threshold
+        self._breaker_cooldown = breaker_cooldown_seconds
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._migrate()
@@ -96,6 +111,20 @@ class Database:
         if "previous_secret_expires_at" not in cols:
             self._conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN previous_secret_expires_at REAL"
+            )
+        if "breaker_state" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN breaker_state TEXT NOT NULL DEFAULT 'closed'"
+            )
+        if "consecutive_failures" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"
+            )
+        if "breaker_opened_at" not in cols:
+            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN breaker_opened_at REAL")
+        if "breaker_probe_task_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN breaker_probe_task_id INTEGER"
             )
 
     def close(self) -> None:
@@ -120,12 +149,16 @@ class Database:
             "created_at": now,
             "paused_at": None,
             "previous_secret_expires_at": None,
+            "breaker_state": "closed",
+            "consecutive_failures": 0,
+            "breaker_opened_at": None,
         }
 
     def list_subscriptions(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at
+                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at,
+                          breaker_state, consecutive_failures, breaker_opened_at
                    FROM subscriptions ORDER BY created_at"""
             ).fetchall()
         return [dict(r) for r in rows]
@@ -133,7 +166,8 @@ class Database:
     def get_subscription(self, sub_id: str) -> dict | None:
         with self._lock:
             row = self._conn.execute(
-                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at
+                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at,
+                          breaker_state, consecutive_failures, breaker_opened_at
                    FROM subscriptions WHERE id = ?""",
                 (sub_id,),
             ).fetchone()
@@ -166,7 +200,8 @@ class Database:
                 )
             self._conn.commit()
             row = self._conn.execute(
-                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at
+                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at,
+                          breaker_state, consecutive_failures, breaker_opened_at
                    FROM subscriptions WHERE id = ?""",
                 (sub_id,),
             ).fetchone()
@@ -213,7 +248,8 @@ class Database:
                 status = "rotated"
             self._conn.commit()
             row = self._conn.execute(
-                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at
+                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at,
+                          breaker_state, consecutive_failures, breaker_opened_at
                    FROM subscriptions WHERE id = ?""",
                 (sub_id,),
             ).fetchone()
@@ -372,8 +408,16 @@ class Database:
         become claimable again, in the same order, once resumed. Tasks
         already 'in_progress' when the pause lands are unaffected and
         run to completion.
+
+        Circuit breaker: subscriptions whose breaker is 'open' are skipped
+        entirely -- tasks keep being accepted and stay 'pending', but no
+        worker claims them. Once the cooldown has expired, the earliest
+        pending task becomes the single half-open probe (see
+        _advance_breakers) and only that task may be claimed until it
+        reaches a terminal state, which closes or re-opens the breaker.
         """
         with self._lock:
+            self._advance_breakers(now)
             row = self._conn.execute(
                 """SELECT t.*, s.target_url, s.secret, s.previous_secret,
                           s.previous_secret_expires_at, e.payload
@@ -382,6 +426,10 @@ class Database:
                    LEFT JOIN events e ON e.id = t.event_id
                    WHERE t.status = 'pending' AND t.next_attempt_at <= ?
                      AND s.paused_at IS NULL
+                     AND (s.id IS NULL
+                          OR s.breaker_state = 'closed'
+                          OR (s.breaker_state = 'half_open'
+                              AND t.id = s.breaker_probe_task_id))
                      AND NOT EXISTS (
                            SELECT 1 FROM tasks earlier
                            WHERE earlier.subscription_id = t.subscription_id
@@ -401,6 +449,41 @@ class Database:
             self._conn.commit()
         return dict(row)
 
+    def _advance_breakers(self, now: float) -> None:
+        """Move cooled-down open breakers to half-open, pinning the probe.
+
+        For each subscription whose cooldown (breaker_opened_at +
+        cooldown) has expired, the earliest pending task becomes the one
+        and only half-open probe. Runs under the connection lock at the
+        start of every claim, so the transition and the probe selection
+        are atomic with respect to claims and no two probes can ever be
+        handed out for the same subscription. Subscriptions with nothing
+        pending stay open until a task arrives.
+        """
+        rows = self._conn.execute(
+            """SELECT id FROM subscriptions
+               WHERE breaker_state = 'open' AND breaker_opened_at IS NOT NULL
+                 AND breaker_opened_at + ? <= ?""",
+            (self._breaker_cooldown, now),
+        ).fetchall()
+        for row in rows:
+            probe = self._conn.execute(
+                """SELECT id FROM tasks
+                   WHERE subscription_id = ? AND status = 'pending'
+                   ORDER BY id LIMIT 1""",
+                (row["id"],),
+            ).fetchone()
+            if probe is None:
+                continue
+            self._conn.execute(
+                """UPDATE subscriptions
+                   SET breaker_state = 'half_open', breaker_probe_task_id = ?
+                   WHERE id = ? AND breaker_state = 'open'""",
+                (probe["id"], row["id"]),
+            )
+        if rows:
+            self._conn.commit()
+
     def finish_attempt(
         self,
         task_id: int,
@@ -412,7 +495,12 @@ class Database:
         outcome: str,  # 'delivered' | 'failed' | 'retry'
         next_attempt_at: float | None,
     ) -> None:
-        """Record an attempt and move the task to its next state, in one commit."""
+        """Record an attempt and move the task to its next state, in one commit.
+
+        Terminal outcomes ('delivered'/'failed') additionally drive the
+        subscription's circuit breaker inside the same transaction, so the
+        failure count and the state flip can never be observed halfway.
+        """
         with self._lock:
             self._conn.execute(
                 """INSERT INTO attempts (task_id, attempt_no, status_code, error, started_at, finished_at)
@@ -433,7 +521,55 @@ class Database:
                        WHERE id = ?""",
                     (outcome, outcome, attempt_no, status_code, error, finished_at, task_id),
                 )
+                self._apply_breaker_outcome(task_id, outcome, finished_at)
             self._conn.commit()
+
+    def _apply_breaker_outcome(self, task_id: int, outcome: str, now: float) -> None:
+        """Apply a terminal task outcome to the subscription's circuit breaker.
+
+        'delivered': resets the consecutive-failure streak; when the task
+        was the half-open probe the breaker closes. 'failed' (final):
+        increments the streak and, on reaching the threshold, atomically
+        flips the breaker to 'open'; a failed half-open probe re-opens the
+        breaker and restarts the cooldown from this moment. Tasks whose
+        subscription is gone match no row and change nothing.
+        """
+        row = self._conn.execute(
+            "SELECT subscription_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return
+        sub_id = row["subscription_id"]
+        if outcome == "delivered":
+            self._conn.execute(
+                """UPDATE subscriptions
+                   SET consecutive_failures = 0,
+                       breaker_state = CASE WHEN breaker_state = 'half_open' THEN 'closed'
+                                            ELSE breaker_state END,
+                       breaker_opened_at = CASE WHEN breaker_state = 'half_open' THEN NULL
+                                                ELSE breaker_opened_at END,
+                       breaker_probe_task_id = NULL
+                   WHERE id = ?""",
+                (sub_id,),
+            )
+        else:  # final failure
+            self._conn.execute(
+                """UPDATE subscriptions
+                   SET consecutive_failures = consecutive_failures + 1,
+                       breaker_state = CASE
+                           WHEN breaker_state = 'half_open' THEN 'open'
+                           WHEN breaker_state = 'closed'
+                                AND consecutive_failures + 1 >= ? THEN 'open'
+                           ELSE breaker_state END,
+                       breaker_opened_at = CASE
+                           WHEN breaker_state = 'half_open' THEN ?
+                           WHEN breaker_state = 'closed'
+                                AND consecutive_failures + 1 >= ? THEN ?
+                           ELSE breaker_opened_at END,
+                       breaker_probe_task_id = NULL
+                   WHERE id = ?""",
+                (self._breaker_threshold, now, self._breaker_threshold, now, sub_id),
+            )
 
     def requeue_in_progress(self) -> int:
         """Reset tasks left 'in_progress' by a previous run (crash/restart recovery)."""

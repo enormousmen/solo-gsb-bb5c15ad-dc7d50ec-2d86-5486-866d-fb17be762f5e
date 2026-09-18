@@ -39,10 +39,19 @@ def _sub_out(sub: dict) -> dict:
     """Serialize a subscription row for the API, deriving the paused flag.
 
     Secret material (current or previous) is never included; only the
-    rotation state (flag + grace expiry) is exposed.
+    rotation state (flag + grace expiry) is exposed. The circuit-breaker
+    state is reported as stored; while open, next_probe_at is the moment
+    the cooldown ends and the earliest pending task may be claimed as the
+    single half-open probe.
     """
     grace_expires = sub.get("previous_secret_expires_at")
     rotating = grace_expires is not None and grace_expires > time.time()
+    opened_at = sub.get("breaker_opened_at")
+    next_probe_at = (
+        opened_at + config.BREAKER_COOLDOWN_SECONDS
+        if sub["breaker_state"] == "open" and opened_at is not None
+        else None
+    )
     return {
         "id": sub["id"],
         "target_url": sub["target_url"],
@@ -51,12 +60,19 @@ def _sub_out(sub: dict) -> dict:
         "paused_at": _iso(sub["paused_at"]),
         "rotating": rotating,
         "previous_secret_expires_at": _iso(grace_expires) if rotating else None,
+        "state": sub["breaker_state"],
+        "consecutive_failures": sub["consecutive_failures"],
+        "next_probe_at": _iso(next_probe_at),
     }
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db = Database(config.DB_PATH)
+    db = Database(
+        config.DB_PATH,
+        breaker_failure_threshold=config.BREAKER_FAILURE_THRESHOLD,
+        breaker_cooldown_seconds=config.BREAKER_COOLDOWN_SECONDS,
+    )
     app.state.db = db
     app.state.http = httpx.AsyncClient(timeout=config.HTTP_TIMEOUT)
 
