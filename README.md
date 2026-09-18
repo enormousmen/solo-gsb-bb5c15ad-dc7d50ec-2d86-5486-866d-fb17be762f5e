@@ -7,6 +7,7 @@
 - **订阅管理**：创建/查询/删除订阅（目标 URL + secret）
 - **订阅暂停/恢复**：`POST /subscriptions/{id}/pause` 暂停后不再领取该订阅的新任务（已 `in_progress` 的尝试正常完成），暂停期间提交的事件照常入库并保持 `pending`；`/resume` 恢复后按原 `next_attempt_at` 与 `task_id` 顺序继续投递，不批量改写调度时间；暂停状态持久化在 SQLite 中，重启后保持
 - **签名密钥平滑轮换**：`POST /subscriptions/{id}/rotate-secret` 原子切换订阅密钥；宽限期（0～86400 秒）内每次投递同时携带按新密钥生成的 `X-Webhook-Signature` 与按旧密钥生成的 `X-Webhook-Signature-Previous`，期满后只发新签名；宽限期内重复轮换返回 `409`，轮换状态持久化、重启后保持，重试按每次实际发送时的状态签名
+- **按订阅投递熔断器**：同一订阅连续最终失败达到 `BREAKER_FAILURE_THRESHOLD` 次即原子熔断（`open`），熔断期间事件照常入库但工作器不再领取；冷却 `BREAKER_COOLDOWN_SECONDS` 秒后仅放行最早待投递任务作为唯一 half-open 探针——成功则关闭并清零计数，失败则重新熔断并刷新冷却时间；状态持久化在 SQLite 中，重启后保持
 - **HMAC 受保护入站接口**：`POST /ingest` 使用 `INGEST_SECRET` 校验 `X-Webhook-Signature`（覆盖时间戳、ID 与原始 JSON），并强制 ±300 秒时间窗
 - **入站幂等与防重放**：已接收的 `X-Webhook-Id` 持久化在 SQLite 中；重复 ID + 相同内容返回首次接收结果且不重复投递，相同 ID 不同内容返回 `409`
 - **事件投递**：一次提交可指定多个订阅，每个订阅生成独立任务
@@ -28,6 +29,7 @@ docker compose up --build
 
 服务启动后访问 **http://localhost:8000**（交互式 API 文档：http://localhost:8000/docs）。
 SQLite 数据库保存在名为 `webhook-data` 的卷中，容器重启后任务不丢失。
+熔断阈值与冷却时间等配置均可在 `docker-compose.yml` 的 `environment` 中调整（见文末配置表）。
 
 `/ingest` 的密钥默认使用 compose 内置的开发值 `dev-ingest-secret-change-me`，生产环境请通过环境变量覆盖：
 
@@ -54,7 +56,7 @@ curl -s -X POST http://localhost:8000/subscriptions \
 ```
 
 ```json
-{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null}
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "rotating": false, "previous_secret_expires_at": null, "state": "closed", "consecutive_failures": 0, "next_probe_at": null}
 ```
 
 ### 2. 提交入站事件（HMAC 保护，POST /ingest）
@@ -182,7 +184,7 @@ curl -s -X POST http://localhost:8000/subscriptions/44a79d7077ce/pause
 ```
 
 ```json
-{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": true, "paused_at": "2026-09-18T08:30:00+00:00"}
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": true, "paused_at": "2026-09-18T08:30:00+00:00", "rotating": false, "previous_secret_expires_at": null, "state": "closed", "consecutive_failures": 0, "next_probe_at": null}
 ```
 
 ```bash
@@ -207,7 +209,7 @@ curl -s -X POST http://localhost:8000/subscriptions/44a79d7077ce/rotate-secret \
 ```
 
 ```json
-{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "rotating": true, "previous_secret_expires_at": "2026-09-18T10:30:00+00:00"}
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "rotating": true, "previous_secret_expires_at": "2026-09-18T10:30:00+00:00", "state": "closed", "consecutive_failures": 0, "next_probe_at": null}
 ```
 
 行为约定：
@@ -227,14 +229,44 @@ curl -s -X POST http://localhost:8000/subscriptions/44a79d7077ce/rotate-secret \
 3. **宽限期内更新接收方配置**：将接收方配置的密钥换成新密钥。期间投递始终双签，接收方无论仍用旧密钥还是已切到新密钥都能验签通过，投递不中断。
 4. **宽限期满**：中继自动停止发送 `X-Webhook-Signature-Previous`，只发新密钥签名；接收方可移除旧密钥与双头兼容逻辑。可用 `GET /subscriptions/{id}` 观察 `rotating` 变回 `false` 确认窗口已结束。
 
+### 7. 投递熔断器（按订阅）
+
+每个订阅自带一个持久化熔断器，避免对持续故障的目标无休止重试。熔断器状态随订阅查询接口返回：
+
+```bash
+curl -s http://localhost:8000/subscriptions/44a79d7077ce
+```
+
+```json
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "rotating": false, "previous_secret_expires_at": null, "state": "open", "consecutive_failures": 5, "next_probe_at": "2026-09-18T09:31:00+00:00"}
+```
+
+三个熔断器字段（`GET /subscriptions`、`GET /subscriptions/{id}` 及各订阅写操作响应均包含）：
+
+| 字段 | 说明 |
+|------|------|
+| `state` | `closed`（正常投递）/ `open`（熔断中，暂停领取）/ `half_open`（探针投递中） |
+| `consecutive_failures` | 当前连续最终失败任务数（成功投递即清零） |
+| `next_probe_at` | 仅 `open` 时有值：冷却到期、允许下一次探针的最早时间（ISO 时间） |
+
+状态机行为约定：
+
+- **累计失败（closed）**：某订阅的任务重试耗尽、最终失败（`failed`）时，该订阅的 `consecutive_failures` 加一；任意一次投递成功都会将其清零（只统计**连续**失败）。
+- **原子熔断（closed → open）**：连续失败数达到 `BREAKER_FAILURE_THRESHOLD`（默认 5）时，计数更新与状态切换在同一个 SQLite 事务中原子落库，不会出现计数与状态不一致的中间态。
+- **熔断期间（open）**：`POST /events` / `POST /ingest` 照常接收该订阅的事件并持久化为 `pending` 任务，但工作器不会领取该订阅的任何任务；`next_probe_at` 显示冷却到期时间。
+- **唯一探针（open → half_open）**：冷却到期（`now >= next_probe_at`）后，该订阅**最早的待投递任务**成为唯一 half-open 探针——状态翻转与任务认领在同一原子临界区内完成，多个工作器并发也只会有一个探针；探针的重试按正常退避进行，期间该订阅的其它任务继续等待。
+- **探针成功（half_open → closed）**：探针任务投递成功，熔断器关闭、`consecutive_failures` 清零，积压任务按原顺序恢复投递。
+- **探针失败（half_open → open）**：探针任务最终失败，熔断器立即重新打开，并以失败时刻为起点刷新冷却时间（`next_probe_at = 失败时刻 + BREAKER_COOLDOWN_SECONDS`）。
+- **持久化**：`state`、`consecutive_failures`、`next_probe_at` 及探针归属全部存储在 SQLite 的 `subscriptions` 表中，服务（或容器）重启后熔断状态、冷却截止时间与探针唯一性继续生效。
+
 ### 其他端点
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `POST` | `/ingest` | HMAC 保护的入站事件接口（时间窗 + 签名 + ID 幂等） |
 | `POST` | `/events` | 内部提交事件（event_id + payload，无需签名） |
-| `GET` | `/subscriptions` | 列出全部订阅（含 `paused` / `paused_at`） |
-| `GET` | `/subscriptions/{id}` | 查询单个订阅（含 `paused` / `paused_at`） |
+| `GET` | `/subscriptions` | 列出全部订阅（含 `paused` / `paused_at` 与熔断器 `state` / `consecutive_failures` / `next_probe_at`） |
+| `GET` | `/subscriptions/{id}` | 查询单个订阅（含 `paused` / `paused_at` 与熔断器 `state` / `consecutive_failures` / `next_probe_at`） |
 | `POST` | `/subscriptions/{id}/pause` | 暂停订阅投递（幂等，不存在返回 404） |
 | `POST` | `/subscriptions/{id}/resume` | 恢复订阅投递（幂等，不存在返回 404） |
 | `POST` | `/subscriptions/{id}/rotate-secret` | 轮换签名密钥（宽限期双签；宽限期内重复轮换返回 409，不存在返回 404） |
@@ -289,6 +321,7 @@ def is_valid_during_rotation(new_secret: str, old_secret: str, body: bytes, head
 - **按订阅有序**：认领查询附带 `NOT EXISTS` 条件——同订阅存在 id 更小且状态为 `pending`/`in_progress` 的任务时，当前任务不可认领；只有前序任务进入终态（`delivered`/`failed`）才放行下一条。条件针对持久化状态在认领时求值，故重试退避、崩溃恢复（`in_progress` 重置为 `pending` 后依然阻塞后续任务）与多工作器并发下均成立；不同订阅互不影响，可并行投递。
 - **订阅暂停**：暂停只是翻转 `subscriptions.paused_at` 标记（首次暂停的时间戳，重复暂停不变），从不修改任务行。认领查询增加 `s.paused_at IS NULL` 条件，与有序约束在同一原子临界区内求值，因此暂停对已 `in_progress` 的尝试（至多 `WORKER_COUNT` 个并发）无影响、它们照常完成，而新的认领立即停摆；恢复时清除标记即可，所有 `pending` 任务保留原 `next_attempt_at` 与 `task_id` 顺序，无需任何批量更新。
 - **密钥轮换**：`subscriptions` 表新增 `previous_secret` 与 `previous_secret_expires_at` 两列（老库由启动迁移自动 `ALTER TABLE` 补齐），二者始终同时设置或同时清空。轮换在连接锁保护的单次提交中原子完成——当前密钥降级为 previous 并写入绝对失效时间，`secret` 列更新为新密钥；`grace_seconds=0` 时直接清空 previous 列。工作器每次认领任务时随连接读出当前密钥状态，构造请求头时按发送时刻判定宽限期是否结束，因此重试、重启后均按当时状态签名；宽限期未结束的再次轮换在判定阶段即被拒绝（409），不产生任何写操作。查询接口只读取失效时间戳推导 `rotating` 标志，密钥明文从不离开持久层进入响应或日志。
+- **投递熔断器**：`subscriptions` 表新增 `breaker_state`、`breaker_consecutive_failures`、`breaker_next_probe_at`、`breaker_probe_task_id` 四列（老库由启动迁移自动补齐，存量订阅初始为 `closed`/0）。任务终态（`delivered`/`failed`）与熔断器记账在 `finish_attempt` 的同一个 SQLite 事务中提交：最终失败使连续失败数加一，达到 `BREAKER_FAILURE_THRESHOLD` 即原子切为 `open` 并写入 `next_probe_at = 失败时刻 + BREAKER_COOLDOWN_SECONDS`；任意成功投递清零计数。认领查询按熔断状态过滤——`open` 且冷却未到的订阅不可认领；冷却到期后首个认领把订阅原子翻为 `half_open` 并把该任务（按订阅有序约束保证即最早待投递任务）登记为唯一探针，`half_open` 期间认领查询只允许探针任务本身通过，故多工作器并发下探针唯一；探针成功则关闭并清零，最终失败则重新 `open` 并以该失败时刻刷新冷却。全部状态持久化，重启（含崩溃恢复）后冷却计时与探针唯一性继续生效。
 - **崩溃恢复**：启动时将残留的 `in_progress` 任务重置为 `pending` 并立即到期；`pending` 任务按原 `next_attempt_at` 继续调度。
 - **退避策略**：第 n 次失败后延迟 `2^(n-1)` 秒（1、2、4），第 4 次失败后任务终止，结果为 `failed`。
 - **成功判定**：仅 HTTP 2xx 视为成功；其余状态码、连接错误、超时均触发重试。
@@ -304,6 +337,8 @@ def is_valid_during_rotation(new_secret: str, old_secret: str, body: bytes, head
 | `HTTP_TIMEOUT_SECONDS` | `5` | 单次投递 HTTP 超时 |
 | `MAX_ATTEMPTS` | `4` | 单任务最大尝试次数 |
 | `BACKOFF_BASE_SECONDS` | `1` | 首次重试延迟（之后每次翻倍） |
+| `BREAKER_FAILURE_THRESHOLD` | `5` | 触发订阅熔断的连续最终失败任务数 |
+| `BREAKER_COOLDOWN_SECONDS` | `30` | 熔断冷却时间（到期后放行唯一 half-open 探针） |
 | `POLL_INTERVAL_SECONDS` | `0.2` | 空闲工作器轮询间隔 |
 
 ## 项目结构

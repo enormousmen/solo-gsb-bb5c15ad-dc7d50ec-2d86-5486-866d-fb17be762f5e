@@ -11,6 +11,12 @@ reached a terminal state (delivered/failed). The rule is enforced inside
 the atomic claim query, so it holds across retries, concurrent workers,
 and restarts, while different subscriptions are still delivered in
 parallel by multiple workers.
+
+A per-subscription circuit breaker (persisted in the DB) stops claiming
+once too many consecutive tasks have failed permanently: while 'open' no
+task of that subscription is claimed; after the cooldown the earliest
+pending task is claimed as the single half-open probe, closing the
+breaker on success or re-opening it (with a fresh cooldown) on failure.
 """
 from __future__ import annotations
 

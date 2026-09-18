@@ -27,6 +27,9 @@ class SubscriptionOut(BaseModel):
     paused_at: str | None
     rotating: bool
     previous_secret_expires_at: str | None
+    state: str  # circuit breaker: 'closed' | 'open' | 'half_open'
+    consecutive_failures: int
+    next_probe_at: str | None  # set only while the breaker is open
 
 
 class SecretRotationCreate(BaseModel):
